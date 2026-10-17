@@ -1154,7 +1154,9 @@
 
         function clearBoardHighlights() {
             while (highlightGroup.children.length > 0) {
-                highlightGroup.remove(highlightGroup.children[0]);
+                const marker = highlightGroup.children[0];
+                highlightGroup.remove(marker);
+                disposeObject3D(marker, true); // Each marker owns its own material
             }
         }
 
@@ -1255,9 +1257,11 @@
                         new THREE.MeshBasicMaterial({
                             color: 0xd0bcff,
                             transparent: true,
-                            opacity: 0.9
+                            opacity: 0.9,
+                            depthTest: false // Drawn on top, so a tall piece in front can't hide a legal destination
                         })
                     );
+                    dot.renderOrder = 10;
                     dot.position.set(pos.x, 0.20, pos.z);
                     dot.userData = { targetSquare: m.to };
                     highlightGroup.add(dot);
@@ -1503,6 +1507,15 @@
         const activeFragments = []; // Physics debris from shattered pieces
         const pieceMeshesBySquare = {}; // 'e2' -> THREE.Group
         let isAnimatingAction = false;
+        let actionSession = 0; // Bumped on reset so in-flight animations and queued AI replies abandon themselves
+
+        // Frees the GPU buffers of an object tree. Shared materials (materials.*) must never be disposed.
+        function disposeObject3D(obj, ownsMaterial = false) {
+            obj.traverse(node => {
+                if (node.geometry) node.geometry.dispose();
+                if (ownsMaterial && node.material) node.material.dispose();
+            });
+        }
 
         function spawnShatterExplosion(worldPos, color) {
             const isWhite = color === 'w';
@@ -1578,6 +1591,7 @@
         // Execute Animated Move or Melee Attack + Shatter Sequence
         function animateChessMove(moveObj, onComplete) {
             isAnimatingAction = true;
+            const session = actionSession;
             const attacker = pieceMeshesBySquare[moveObj.from];
             if (!attacker) {
                 isAnimatingAction = false;
@@ -1629,6 +1643,7 @@
             audioFX.playMove();
 
             function step(now) {
+                if (session !== actionSession) return; // The board was reset mid-animation
                 const elapsed = (now - startTime) / 1000;
                 const t = Math.min(elapsed / duration, 1);
 
@@ -1673,6 +1688,7 @@
                             audioFX.playShatter();
                             spawnShatterExplosion(defender.position, defender.userData.color);
                             piecesGroup.remove(defender);
+                            disposeObject3D(defender);
                             delete pieceMeshesBySquare[captureSq];
                         }
                     } else {
@@ -1700,6 +1716,7 @@
                     // Handle Pawn Promotion Visual Transfiguration
                     if (moveObj.flags.includes('p') && moveObj.promotion) {
                         piecesGroup.remove(attacker);
+                        disposeObject3D(attacker);
                         const promotedMesh = createWizardPieceMesh(moveObj.promotion, moveObj.color);
                         promotedMesh.position.copy(targetPos);
                         promotedMesh.userData.square = moveObj.to;
@@ -1728,11 +1745,15 @@
         let lastMoveRecord = null;
         let playAgainstAI = true;
         let pendingPromotionMove = null;
+        let gameOverAnnounced = false; // The result dialog is shown once per game
+        let aiMoveTimer = null;
 
         // Rebuild all 32 pieces on the board from current FEN
         function syncBoardWithGameState() {
             while (piecesGroup.children.length > 0) {
-                piecesGroup.remove(piecesGroup.children[0]);
+                const piece = piecesGroup.children[0];
+                piecesGroup.remove(piece);
+                disposeObject3D(piece);
             }
             Object.keys(pieceMeshesBySquare).forEach(k => delete pieceMeshesBySquare[k]);
 
@@ -1768,10 +1789,34 @@
             return null;
         }
 
+        // Title, one-line summary and full description of a finished game
+        function describeGameResult() {
+            if (game.in_checkmate()) {
+                const winner = game.turn() === 'w' ? 'Obsidian (Black)' : 'Marble (White)';
+                return {
+                    title: 'CHECKMATE',
+                    summary: `${winner} triumphs`,
+                    detail: `${winner} triumphs in the Gothic Sanctuary!`
+                };
+            }
+            if (game.in_stalemate()) {
+                return { title: 'SANCTUARY DRAW', summary: 'Stalemate', detail: 'The king to move has no legal move, yet is not in check. The battle ends in stalemate.' };
+            }
+            if (game.in_threefold_repetition()) {
+                return { title: 'SANCTUARY DRAW', summary: 'Draw by repetition', detail: 'The same position has arisen three times. The battle ends in a draw.' };
+            }
+            if (game.insufficient_material()) {
+                return { title: 'SANCTUARY DRAW', summary: 'Draw by insufficient material', detail: 'Neither side has enough material left to deliver checkmate.' };
+            }
+            return { title: 'SANCTUARY DRAW', summary: 'Draw by the fifty-move rule', detail: 'Fifty moves have passed without a capture or a pawn move.' };
+        }
+
         // Update Top Status Banner, Captured Pieces & Move Chronicle
         function updateUI() {
             const turn = game.turn(); // 'w' or 'b'
             const inCheck = game.in_check();
+            const gameOver = game.game_over();
+            const result = gameOver ? describeGameResult() : null;
             const turnSwatch = document.getElementById('turn-swatch');
             const turnText = document.getElementById('turn-text');
             const statusSubtext = document.getElementById('status-subtext');
@@ -1785,7 +1830,12 @@
                 turnText.textContent = playAgainstAI ? "ARCHMAGE AI THINKING..." : "OBSIDIAN'S TURN (BLACK)";
             }
 
-            if (inCheck) {
+            if (gameOver) {
+                turnBanner.classList.remove('check-alert');
+                turnText.textContent = result.title;
+                statusSubtext.textContent = `${result.summary} — press Reset to play again`;
+                statusSubtext.className = 'text-[11px] text-amber-300 font-semibold';
+            } else if (inCheck) {
                 turnBanner.classList.add('check-alert');
                 statusSubtext.textContent = '⚠️ ROYAL KING IS UNDER ATTACK!';
                 statusSubtext.className = 'text-[11px] text-rose-400 font-semibold';
@@ -1860,28 +1910,25 @@
                 tbody.parentElement.scrollTop = tbody.parentElement.scrollHeight;
             }
 
-            // Check Game Over Conditions
-            if (game.game_over()) {
+            // Announce Game Over once; later UI refreshes (e.g. toggling the mode) must not reopen the dialog
+            if (gameOver && !gameOverAnnounced) {
+                gameOverAnnounced = true;
                 const modal = document.getElementById('gameover-modal');
-                const title = document.getElementById('gameover-title');
-                const desc = document.getElementById('gameover-desc');
-
-                if (game.in_checkmate()) {
-                    const winner = game.turn() === 'w' ? 'Obsidian (Black)' : 'Marble (White)';
-                    title.textContent = 'CHECKMATE';
-                    desc.textContent = `${winner} triumphs in the Gothic Sanctuary!`;
-                } else {
-                    title.textContent = 'SANCTUARY DRAW';
-                    desc.textContent = 'The battle concludes in an eternal stalemate.';
-                }
+                document.getElementById('gameover-title').textContent = result.title;
+                document.getElementById('gameover-desc').textContent = result.detail;
                 modal.classList.remove('hidden');
                 modal.classList.add('flex');
                 audioFX.playCheck();
             }
         }
 
-        // Minimax AI with Piece-Square Positional Awareness & Capture Prioritization
+        // Archmage AI: alpha-beta minimax with iterative deepening, capture-only quiescence and a hard time budget
         const PIECE_VALUES = { p: 100, n: 320, b: 330, r: 500, q: 900, k: 20000 };
+        const MATE_SCORE = 100000;
+        const AI_THINK_MS = 300;       // Hard budget per move so the render loop never stalls noticeably
+        const AI_MAX_DEPTH = 4;
+        const QUIESCENCE_DEPTH = 4;
+        const SEARCH_TIMEOUT = Symbol('search-timeout');
 
         function evaluateBoardState(chessInstance) {
             const b = chessInstance.board();
@@ -1899,53 +1946,160 @@
             return score;
         }
 
-        function chooseBestWizardMove() {
+        // Score (from White's perspective) when the side to move has no legal moves: mate or stalemate.
+        // Subtracting the ply makes the AI prefer faster mates and slower losses.
+        function scoreNoMoves(ply) {
+            if (!game.in_check()) return 0;
+            return game.turn() === 'w' ? -(MATE_SCORE - ply) : (MATE_SCORE - ply);
+        }
+
+        // Captures & promotions first (most valuable victim, least valuable attacker) so alpha-beta prunes more
+        function moveOrderKey(m) {
+            let key = 0;
+            if (m.captured) key += PIECE_VALUES[m.captured] * 10 - PIECE_VALUES[m.piece];
+            if (m.promotion) key += PIECE_VALUES[m.promotion];
+            return key;
+        }
+
+        function orderMoves(moves) {
+            return moves.sort((a, b) => moveOrderKey(b) - moveOrderKey(a));
+        }
+
+        // Past the nominal depth only captures/promotions are searched, so a leaf is never evaluated mid-exchange
+        function quiescence(alpha, beta, ply, qDepth) {
             const moves = game.moves({ verbose: true });
-            if (moves.length === 0) return null;
+            if (moves.length === 0) return scoreNoMoves(ply);
 
-            const isMaximizing = game.turn() === 'w';
-            let bestMove = moves[0];
-            let bestValue = isMaximizing ? -Infinity : Infinity;
+            const maximizing = game.turn() === 'w';
+            let best = evaluateBoardState(game); // Stand pat: the side to move may decline every capture
+            if (qDepth === 0) return best;
+            if (maximizing) {
+                if (best >= beta) return best;
+                alpha = Math.max(alpha, best);
+            } else {
+                if (best <= alpha) return best;
+                beta = Math.min(beta, best);
+            }
 
-            // Sort captures first for lively Wizard's Chess combat
-            moves.sort((a, b) => (b.captured ? 1 : 0) - (a.captured ? 1 : 0));
+            const tactical = orderMoves(moves.filter(m => m.captured || m.promotion));
+            for (const m of tactical) {
+                game.move(m);
+                let score;
+                try {
+                    score = quiescence(alpha, beta, ply + 1, qDepth - 1);
+                } finally {
+                    game.undo();
+                }
+                if (maximizing) {
+                    if (score > best) best = score;
+                    if (best > alpha) alpha = best;
+                } else {
+                    if (score < best) best = score;
+                    if (best < beta) beta = best;
+                }
+                if (beta <= alpha) break;
+            }
+            return best;
+        }
 
+        function searchPosition(depth, alpha, beta, ply, deadline) {
+            if (performance.now() > deadline) throw SEARCH_TIMEOUT;
+            if (depth === 0) return quiescence(alpha, beta, ply, QUIESCENCE_DEPTH);
+
+            const moves = orderMoves(game.moves({ verbose: true }));
+            if (moves.length === 0) return scoreNoMoves(ply);
+
+            const maximizing = game.turn() === 'w';
+            let best = maximizing ? -Infinity : Infinity;
             for (const m of moves) {
                 game.move(m);
-                // 1-ply reply lookahead
-                const replies = game.moves({ verbose: true });
-                let worstReplyEval = evaluateBoardState(game);
+                let score;
+                try {
+                    score = searchPosition(depth - 1, alpha, beta, ply + 1, deadline);
+                } finally {
+                    game.undo();
+                }
+                if (maximizing) {
+                    if (score > best) best = score;
+                    if (best > alpha) alpha = best;
+                } else {
+                    if (score < best) best = score;
+                    if (best < beta) beta = best;
+                }
+                if (beta <= alpha) break;
+            }
+            return best;
+        }
 
-                if (replies.length > 0) {
-                    // Check top tactical responses
-                    const sampleReplies = replies.slice(0, 10);
-                    for (const rep of sampleReplies) {
-                        game.move(rep);
-                        const ev = evaluateBoardState(game);
-                        if (isMaximizing) {
-                            if (ev < worstReplyEval) worstReplyEval = ev;
-                        } else {
-                            if (ev > worstReplyEval) worstReplyEval = ev;
+        function shuffleMoves(moves) {
+            for (let i = moves.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [moves[i], moves[j]] = [moves[j], moves[i]];
+            }
+            return moves;
+        }
+
+        function chooseBestWizardMove() {
+            // Shuffle before the (stable) capture-first sort, so equally good moves are picked at random and
+            // games don't repeat. Scores themselves are never jittered: that would corrupt the alpha-beta bounds.
+            const rootMoves = orderMoves(shuffleMoves(game.moves({ verbose: true })));
+            if (rootMoves.length === 0) return null;
+
+            const maximizing = game.turn() === 'w';
+            const deadline = performance.now() + AI_THINK_MS;
+            let bestMove = rootMoves[0];
+
+            // Iterative deepening: each finished depth replaces the answer; a timeout keeps the last finished one
+            for (let depth = 1; depth <= AI_MAX_DEPTH; depth++) {
+                let depthBest = null;
+                let depthBestScore = maximizing ? -Infinity : Infinity;
+                let alpha = -Infinity;
+                let beta = Infinity;
+                try {
+                    for (const m of rootMoves) {
+                        game.move(m);
+                        let score;
+                        try {
+                            score = searchPosition(depth - 1, alpha, beta, 1, deadline);
+                        } finally {
+                            game.undo();
                         }
-                        game.undo();
+                        // A move no better than the current best fails high and returns only a bound, so the
+                        // strict comparison skips it. With captures sorted first, a capture wins any tie.
+                        if (maximizing ? score > depthBestScore : score < depthBestScore) {
+                            depthBestScore = score;
+                            depthBest = m;
+                        }
+                        if (maximizing) alpha = Math.max(alpha, score);
+                        else beta = Math.min(beta, score);
                     }
+                } catch (e) {
+                    if (e !== SEARCH_TIMEOUT) throw e;
+                    break;
                 }
 
-                // Slight bonus for dramatic captures so the user gets to enjoy shatter animations
-                const dramaBonus = m.captured ? (isMaximizing ? 25 : -25) : 0;
-                const totalEval = worstReplyEval + dramaBonus + (Math.random() - 0.5) * 12;
-
-                if (isMaximizing && totalEval > bestValue) {
-                    bestValue = totalEval;
-                    bestMove = m;
-                } else if (!isMaximizing && totalEval < bestValue) {
-                    bestValue = totalEval;
-                    bestMove = m;
-                }
-                game.undo();
+                bestMove = depthBest;
+                // Search the best move first next iteration for better pruning
+                rootMoves.splice(rootMoves.indexOf(depthBest), 1);
+                rootMoves.unshift(depthBest);
+                if (Math.abs(depthBestScore) >= MATE_SCORE - 100) break; // Forced mate found
             }
 
             return bestMove;
+        }
+
+        // The Archmage replies after a short beat. Everything is re-checked when the timer fires, so a Reset
+        // or a switch to 2-player during the delay can never make the AI move on a board it shouldn't touch.
+        function scheduleAIMove(delay = 380) {
+            clearTimeout(aiMoveTimer);
+            const session = actionSession;
+            aiMoveTimer = setTimeout(() => {
+                aiMoveTimer = null;
+                if (session !== actionSession || !playAgainstAI || game.turn() !== 'b') return;
+                if (isAnimatingAction || game.game_over()) return;
+                const aiMove = chooseBestWizardMove();
+                if (aiMove) commitValidatedMove(aiMove);
+            }, delay);
         }
 
         function commitValidatedMove(moveConfig) {
@@ -1960,15 +2114,7 @@
             animateChessMove(moveResult, () => {
                 if (game.in_check()) audioFX.playCheck();
                 updateUI();
-
-                // Auto-rotate camera in 2P mode if user set Top or Dynamic view, or trigger AI if vs AI
-                if (!game.game_over() && playAgainstAI && game.turn() === 'b') {
-                    setTimeout(() => {
-                        if (isAnimatingAction || game.game_over()) return;
-                        const aiMove = chooseBestWizardMove();
-                        if (aiMove) commitValidatedMove(aiMove);
-                    }, 380);
-                }
+                if (playAgainstAI && game.turn() === 'b') scheduleAIMove();
             });
         }
 
@@ -2030,12 +2176,33 @@
         let pointerDownPos = { x: 0, y: 0 };
         let lastPointerPos = { x: 0, y: 0 };
         let hasDragged = false;
+        let pinchStartDist = 0; // Non-zero while a two-finger pinch-to-zoom is in progress
+        let pinchStartRadius = 0;
 
         const raycaster = new THREE.Raycaster();
         const mouseNDC = new THREE.Vector2();
 
+        function clampRadius(radius) {
+            return Math.max(10, Math.min(32, radius));
+        }
+
+        function touchDistance(touches) {
+            return Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
+        }
+
+        function beginPinch(touches) {
+            isPointerDown = false; // A two-finger gesture is never a click or an orbit
+            hasDragged = true;
+            pinchStartDist = touchDistance(touches);
+            pinchStartRadius = camState.targetRadius;
+        }
+
         function onPointerDown(e) {
             if (e.target !== renderer.domElement) return;
+            if (e.touches && e.touches.length >= 2) {
+                beginPinch(e.touches);
+                return;
+            }
             isPointerDown = true;
             hasDragged = false;
             const clientX = e.touches ? e.touches[0].clientX : e.clientX;
@@ -2045,6 +2212,12 @@
         }
 
         function onPointerMove(e) {
+            if (e.touches && e.touches.length >= 2) {
+                if (!pinchStartDist) beginPinch(e.touches);
+                const dist = touchDistance(e.touches);
+                if (dist > 0) camState.targetRadius = clampRadius(pinchStartRadius * pinchStartDist / dist);
+                return;
+            }
             if (!isPointerDown) return;
             const clientX = e.touches ? e.touches[0].clientX : e.clientX;
             const clientY = e.touches ? e.touches[0].clientY : e.clientY;
@@ -2064,7 +2237,28 @@
             lastPointerPos = { x: clientX, y: clientY };
         }
 
+        // Resolve the pointer ray to a square. Legal-move markers win even when a tall piece in front hides
+        // them, because clicking a marker is an explicit "move here"; otherwise the nearest piece, then the tile.
+        function pickSquareUnderPointer() {
+            const markerHit = raycaster.intersectObjects(highlightGroup.children, false)
+                .find(hit => hit.object.userData.targetSquare);
+            if (markerHit) return markerHit.object.userData.targetSquare;
+
+            const pieceHits = raycaster.intersectObjects(piecesGroup.children, true);
+            if (pieceHits.length > 0) {
+                let obj = pieceHits[0].object;
+                while (obj && !obj.userData.square) {
+                    obj = obj.parent;
+                }
+                if (obj) return obj.userData.square;
+            }
+
+            const tileHits = raycaster.intersectObjects(tileMeshes, false);
+            return tileHits.length > 0 ? tileHits[0].object.userData.square : null;
+        }
+
         function onPointerUp(e) {
+            if (e.touches && e.touches.length < 2) pinchStartDist = 0;
             if (!isPointerDown) return;
             isPointerDown = false;
 
@@ -2078,24 +2272,8 @@
 
                 raycaster.setFromCamera(mouseNDC, camera);
 
-                // Check pieces, highlight markers, and board tiles
-                const pieceHits = raycaster.intersectObjects(piecesGroup.children, true);
-                if (pieceHits.length > 0) {
-                    let obj = pieceHits[0].object;
-                    while (obj && !obj.userData.square) {
-                        obj = obj.parent;
-                    }
-                    if (obj && obj.userData.square) {
-                        handleSquareClick(obj.userData.square);
-                        return;
-                    }
-                }
-
-                const tileHits = raycaster.intersectObjects(tileMeshes, false);
-                if (tileHits.length > 0) {
-                    const sq = tileHits[0].object.userData.square;
-                    if (sq) handleSquareClick(sq);
-                }
+                const sq = pickSquareUnderPointer();
+                if (sq) handleSquareClick(sq);
             }
         }
 
@@ -2109,7 +2287,7 @@
 
         renderer.domElement.addEventListener('wheel', (e) => {
             e.preventDefault();
-            camState.targetRadius = Math.max(10, Math.min(32, camState.targetRadius + e.deltaY * 0.012));
+            camState.targetRadius = clampRadius(camState.targetRadius + e.deltaY * 0.012);
         }, { passive: false });
 
         /***********************************************************************
@@ -2137,12 +2315,11 @@
                 modeBtn.classList.add('md3-btn-active');
                 modeIcon.textContent = 'smart_toy';
                 modeLabel.textContent = 'vs. Archmage AI';
-                // If it's currently Black's turn, let AI move immediately
-                if (!game.game_over() && game.turn() === 'b' && !isAnimatingAction) {
-                    const aiMove = chooseBestWizardMove();
-                    if (aiMove) commitValidatedMove(aiMove);
-                }
+                // If it's currently Black's turn, the Archmage takes over after a short beat
+                if (game.turn() === 'b') scheduleAIMove();
             } else {
+                clearTimeout(aiMoveTimer); // A reply queued during the delay must not fire in 2-player mode
+                aiMoveTimer = null;
                 modeBtn.classList.remove('md3-btn-active');
                 modeIcon.textContent = 'group';
                 modeLabel.textContent = '2P Pass & Play';
@@ -2154,6 +2331,7 @@
         // 3. Wizard Strike Button (Executes best tactical/capture move immediately for current player)
         document.getElementById('wizard-hint-btn').addEventListener('click', () => {
             if (isAnimatingAction || game.game_over()) return;
+            if (playAgainstAI && game.turn() === 'b') return; // The Archmage is already on it
             const bestMove = chooseBestWizardMove();
             if (bestMove) commitValidatedMove(bestMove);
         });
@@ -2193,11 +2371,18 @@
 
         // 6. Reset Game Function
         function resetSanctuaryGame() {
-            if (isAnimatingAction) return;
+            // Abandon any in-flight move animation and queued AI reply rather than ignoring the click
+            actionSession++;
+            isAnimatingAction = false;
+            clearTimeout(aiMoveTimer);
+            aiMoveTimer = null;
+
             game.reset();
             selectedSquare = null;
             currentLegalMoves = [];
             lastMoveRecord = null;
+            pendingPromotionMove = null;
+            gameOverAnnounced = false;
             document.getElementById('gameover-modal').classList.add('hidden');
             document.getElementById('gameover-modal').classList.remove('flex');
             syncBoardWithGameState();
@@ -2297,6 +2482,7 @@
 
                 if (frag.life <= 0) {
                     scene.remove(frag.mesh);
+                    disposeObject3D(frag.mesh, Boolean(frag.isShockwave)); // Shards share piece materials; the shockwave owns its own
                     activeFragments.splice(i, 1);
                     continue;
                 }
