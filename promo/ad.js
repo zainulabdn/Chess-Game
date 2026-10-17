@@ -354,14 +354,18 @@
         wordmark(W / 2, 250, 66, k, (t - T.features - 0.6) / 0.9);
         gline(W / 2 - 220, W / 2 + 220, 312, k);
         const rows = ['Full chess rules, every move validated', 'Archmage AI opponent', 'Pass & play for two', 'Runs in any modern browser'];
+        // All chips share one width, sized to the longest line so no text can run past the rounded end
+        ctx.font = '500 36px Inter'; ctx.letterSpacing = '0px';
+        const chipW = Math.max(...rows.map(r => ctx.measureText(r).width)) + 130;
+        const chipX = (W - chipW) / 2;
         rows.forEach((r, i) => {
             const rk = Math.min(easeOut((t - T.features - 0.5 - i * 0.22) / 0.45), k);
             if (rk <= 0) return;
             const dx = (1 - easeOutBack(rk)) * 70;
             const y = 470 + i * 94;
-            frosted(210 + dx, y - 38, 660, 76, 38, rk);
-            checkIcon(258 + dx, y, rk);
-            text(r, 296 + dx, y, { font: '500 36px Inter', color: WHITE, align: 'left', alpha: rk });
+            frosted(chipX + dx, y - 38, chipW, 76, 38, rk);
+            checkIcon(chipX + 48 + dx, y, rk);
+            text(r, chipX + 86 + dx, y, { font: '500 36px Inter', color: WHITE, align: 'left', alpha: rk });
         });
     }
 
