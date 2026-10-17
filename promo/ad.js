@@ -21,10 +21,31 @@
         intro: [0.3, 4.0], play: 4.0, cap1: [4.0, 10.6], cap2: [11.0, 13.6], cap3: [13.6, 16.2],
         mate: 17.3, mateEnd: 20.3, features: 20.3, featuresEnd: 27.0, outro: 27.0, fadeOut: 30.6, total: 31.4
     };
-    const CAMERA = [ // [time, theta, phi, radius]
-        [0.0, -0.55, 1.02, 26.0], [4.0, -0.30, 0.95, 18.5], [11.0, 0.25, 0.93, 18.0], [15.0, 0.45, 0.90, 17.0],
-        [17.3, 0.65, 1.08, 15.0], [20.3, 0.80, 1.00, 16.0], [31.4, 1.30, 0.98, 18.0]
+    // Camera choreography. Each keyframe: time, orbit angles, distance and the point the camera looks at.
+    // A keyframe marked `cut` snaps into place at its time (hard cut) instead of easing from the previous one.
+    const sq = s => { const p = squareToWorld(s); return [p.x, 0.5, p.z]; };
+    const CENTRE = [0, 0.6, 0];
+    const CAMERA = [
+        { t: 0.0, th: -1.30, ph: 0.55, r: 34.0, f: CENTRE },               // high, wide cathedral shot
+        { t: 2.2, th: -0.70, ph: 0.85, r: 24.0, f: CENTRE },
+        { t: 4.0, th: -0.35, ph: 0.95, r: 17.0, f: CENTRE },               // settled for the opening
+        { t: 6.5, th: 0.00, ph: 0.90, r: 14.5, f: [0.8, 0.6, 1.5] },       // push in toward the white side
+        { t: 9.0, th: 0.35, ph: 1.00, r: 19.0, f: CENTRE },                // pull back out
+        { t: 11.1, th: 0.50, ph: 0.92, r: 17.5, f: CENTRE },
+        { t: 11.25, th: 0.90, ph: 1.12, r: 9.0, f: sq('e5'), cut: true },  // close-up: knight takes e5
+        { t: 12.6, th: 1.05, ph: 1.08, r: 10.5, f: sq('e5') },
+        { t: 12.65, th: -0.60, ph: 1.10, r: 9.5, f: sq('d1'), cut: true }, // close-up: bishop takes the queen
+        { t: 14.0, th: -0.40, ph: 1.05, r: 11.0, f: sq('d1') },
+        { t: 14.05, th: 2.60, ph: 1.05, r: 10.0, f: sq('f7'), cut: true }, // close-up from behind black: Bxf7+
+        { t: 15.5, th: 2.40, ph: 1.00, r: 12.0, f: sq('f7') },
+        { t: 15.55, th: 0.40, ph: 0.95, r: 18.0, f: CENTRE, cut: true },   // wide for the king's escape
+        { t: 16.6, th: 0.50, ph: 1.00, r: 16.0, f: [0.4, 0.5, -2.0] },
+        { t: 17.3, th: 0.75, ph: 1.10, r: 12.0, f: [0.8, 0.6, -2.4] },     // low on the mated king
+        { t: 20.3, th: 0.95, ph: 1.05, r: 10.5, f: [0.8, 0.6, -2.4] },
+        { t: 20.35, th: 2.20, ph: 0.80, r: 26.0, f: CENTRE, cut: true },   // slow wide orbit behind the cards
+        { t: 31.4, th: 3.40, ph: 0.90, r: 20.0, f: CENTRE }
     ];
+    const CUT_TIMES = CAMERA.filter(k => k.cut).map(k => k.t);
     const CAPTURE_IMPACT = 0.568; // seconds after a capture move starts, when the game spawns the shatter
     const MOVE_DURATION = 0.52;
 
@@ -37,11 +58,22 @@
 
     function cameraAt(t) {
         let i = 0;
-        while (i < CAMERA.length - 2 && t > CAMERA[i + 1][0]) i++;
+        while (i < CAMERA.length - 2 && t >= CAMERA[i + 1].t) i++;
         const a = CAMERA[i], b = CAMERA[i + 1];
-        const p = smooth((t - a[0]) / (b[0] - a[0]));
-        return [a[1] + (b[1] - a[1]) * p, a[2] + (b[2] - a[2]) * p, a[3] + (b[3] - a[3]) * p];
+        if (b.cut && t < b.t) return a;
+        const p = smooth((t - a.t) / Math.max(1e-6, b.t - a.t));
+        const mix = (u, v) => u + (v - u) * p;
+        return { th: mix(a.th, b.th), ph: mix(a.ph, b.ph), r: mix(a.r, b.r), f: [mix(a.f[0], b.f[0]), mix(a.f[1], b.f[1]), mix(a.f[2], b.f[2])] };
     }
+
+    // The game orbits the camera around the board centre and looks at (0, 0.6, 0). Shift that orbit onto the
+    // current focus point so close-ups can frame a single square.
+    const focus = new THREE.Vector3(0, 0.6, 0);
+    const originalLookAt = camera.lookAt.bind(camera);
+    camera.lookAt = function () {
+        camera.position.x += focus.x; camera.position.y += focus.y - 0.6; camera.position.z += focus.z;
+        originalLookAt(focus.x, focus.y, focus.z);
+    };
 
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
@@ -229,6 +261,7 @@
             if (im.kind === 'shatter' && d < 0.35) { scale = Math.max(scale, 1 + 0.045 * (1 - d / 0.35)); flash = Math.max(flash, 0.35 * (1 - d / 0.25)); shake = Math.max(shake, 7 * (1 - d / 0.35)); }
             if (im.kind === 'mate' && d < 0.6) { scale = Math.max(scale, 1 + 0.07 * (1 - d / 0.6)); red = Math.max(red, 0.45 * (1 - d / 0.5)); shake = Math.max(shake, 16 * (1 - d / 0.6)); if (!burstDone) { burstDone = true; spawnBurst(70); } }
         }
+        for (const c of CUT_TIMES) { const d = t - c; if (d >= 0 && d < 0.18) flash = Math.max(flash, 0.22 * (1 - d / 0.18)); }
         const ox = (Math.random() - 0.5) * 2 * shake, oy = (Math.random() - 0.5) * 2 * shake;
         const dw = W * scale, dh = H * scale;
         ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H);
@@ -397,8 +430,11 @@
     };
     log.mime = mime;
 
-    const [th0, ph0, ra0] = cameraAt(0);
-    camState.theta = camState.targetTheta = th0; camState.phi = camState.targetPhi = ph0; camState.radius = camState.targetRadius = ra0;
+    function applyCamera(c) {
+        camState.theta = camState.targetTheta = c.th; camState.phi = camState.targetPhi = c.ph; camState.radius = camState.targetRadius = c.r;
+        focus.set(c.f[0], c.f[1], c.f[2]);
+    }
+    applyCamera(cameraAt(0));
     await new Promise(r => setTimeout(r, 200));
     draw(0);
 
@@ -410,8 +446,7 @@
     function tick(now) {
         try {
             const t = (now - t0) / 1000;
-            const [th, ph, ra] = cameraAt(t);
-            camState.theta = camState.targetTheta = th; camState.phi = camState.targetPhi = ph; camState.radius = camState.targetRadius = ra;
+            applyCamera(cameraAt(t));
             scheduler(t);
             if (renderer.info.render.frame === lastFrame) renderer.render(scene, camera);
             lastFrame = renderer.info.render.frame;
